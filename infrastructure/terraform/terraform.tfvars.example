@@ -1,0 +1,24 @@
+# Copy to terraform.tfvars and edit.
+
+project_name = "enterprise-rag"
+environment  = "dev"
+region       = "ap-south-1"
+
+# REQUIRED. Find valid ARNs for your account with:
+#   aws bedrock list-inference-profiles --region ap-south-1 \
+#     --query "inferenceProfileSummaries[].inferenceProfileArn"
+# Examples (replace 111122223333 with your account id):
+#   Amazon Nova Pro : arn:aws:bedrock:ap-south-1:111122223333:inference-profile/apac.amazon.nova-pro-v1:0
+#   Anthropic Claude: pick the apac.anthropic.claude-* profile the command lists
+generation_model_arn = "arn:aws:bedrock:ap-south-1:111122223333:inference-profile/apac.amazon.nova-pro-v1:0"
+
+# Reranking is only offered in some regions. Leave empty in ap-south-1 unless the console lists a reranker.
+rerank_model_arn = ""
+
+departments = ["hr", "finance", "it", "projects", "training"]
+
+enable_guardrail           = true
+enable_query_decomposition = true
+enable_waf                 = false
+
+alarm_email = ""  # e.g. "platform-team@example.com"

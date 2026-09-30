@@ -1,0 +1,9 @@
+{
+  "metadataAttributes": {
+    "department": "finance",
+    "document_type": "policy",
+    "classification": "internal",
+    "year": 2026,
+    "owner": "finance-controller"
+  }
+}

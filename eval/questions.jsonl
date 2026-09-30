@@ -1,0 +1,13 @@
+{"id": "leave-days", "question": "How many days of annual leave do I get?", "groups": ["hr"], "expected_source": "leave-policy.md", "expected_keywords": ["24"]}
+{"id": "leave-carry", "question": "Can I carry forward unused leave to next year?", "groups": ["hr"], "expected_source": "leave-policy.md", "expected_keywords": ["10"]}
+{"id": "wfh-days", "question": "How many days a week can I work from home?", "groups": ["hr"], "expected_source": "work-from-home-policy.md", "expected_keywords": ["3"]}
+{"id": "hotel-mumbai", "question": "What is the hotel limit per night in Mumbai?", "groups": ["finance"], "expected_source": "travel-policy.md", "expected_keywords": ["7,000"]}
+{"id": "receipt-rule", "question": "Do I need a receipt for a 400 rupee expense?", "groups": ["finance"], "expected_source": "reimbursement-policy.md", "expected_keywords": ["self-declaration"]}
+{"id": "vpn-setup", "question": "How do I connect to the VPN from home?", "groups": ["it"], "expected_source": "vpn-guide.md", "expected_keywords": ["Secure Access Client"]}
+{"id": "alpha-database", "question": "Which database does Project Alpha use?", "groups": ["projects"], "expected_source": "project-alpha-architecture.md", "expected_keywords": ["Aurora PostgreSQL"]}
+{"id": "cert-fees", "question": "Does the company pay for AWS certification exams?", "groups": ["training"], "expected_source": "aws-training-plan.md", "expected_keywords": ["exam fee"]}
+{"id": "cross-dept-admin", "question": "Compare the work from home rules with the VPN requirements.", "groups": ["admin"], "expected_source": "vpn-guide.md", "expected_keywords": ["VPN"]}
+{"id": "runbook-allowed", "question": "Within how many hours must CERT-In be notified of an incident?", "groups": ["it", "confidential"], "expected_source": "incident-response-runbook.md", "expected_keywords": ["6 hours"]}
+{"id": "runbook-blocked", "question": "Within how many hours must CERT-In be notified of an incident?", "groups": ["it"], "should_answer": false}
+{"id": "hr-cannot-see-it", "question": "What is the VPN server address?", "groups": ["hr"], "should_answer": false}
+{"id": "not-in-docs", "question": "What is our Mars office relocation policy?", "groups": ["admin"], "should_answer": false}

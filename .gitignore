@@ -1,0 +1,11 @@
+build/
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+terraform.tfvars
+frontend/config.js
+__pycache__/
+.pytest_cache/
+*.pyc
+.DS_Store

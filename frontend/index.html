@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Company knowledge assistant</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+  <script src="config.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span id="app-name">Company knowledge assistant</span>
+    </div>
+    <div class="account" id="account" hidden>
+      <span class="groups" id="groups"></span>
+      <button class="ghost" id="sync-btn" hidden>Sync documents</button>
+      <span class="email" id="email"></span>
+      <button class="ghost" id="logout-btn">Sign out</button>
+    </div>
+  </header>
+
+  <main id="signed-out" class="signed-out" hidden>
+    <h1>Answers from your company's documents</h1>
+    <p>Ask about policies, procedures and projects. Every answer links to the page it came from, and you'll only see documents your team has access to.</p>
+    <button class="primary" id="login-btn">Sign in with your company account</button>
+    <p class="error" id="login-error" role="alert"></p>
+  </main>
+
+  <div id="app" class="layout" hidden>
+    <aside class="history" aria-label="Your recent questions">
+      <h2>Recent questions</h2>
+      <ol id="history-list"></ol>
+      <p class="muted" id="history-empty">Questions you ask will appear here.</p>
+    </aside>
+
+    <section class="chat" aria-label="Conversation">
+      <div id="thread" class="thread" aria-live="polite">
+        <div id="welcome" class="welcome">
+          <h1>What do you need to know?</h1>
+          <p>Try one of these, or ask your own question.</p>
+          <div class="suggestions">
+            <button class="suggestion">How many days of annual leave do I get?</button>
+            <button class="suggestion">What's the hotel limit when travelling to Mumbai?</button>
+            <button class="suggestion">How do I connect to the VPN from home?</button>
+            <button class="suggestion">Compare the work-from-home policy with the VPN rules.</button>
+          </div>
+        </div>
+      </div>
+
+      <form id="ask-form" class="composer">
+        <label for="question" class="sr-only">Your question</label>
+        <textarea id="question" rows="2" maxlength="1000" placeholder="How do I claim a taxi fare from the airport?"></textarea>
+        <div class="composer-row">
+          <button type="button" class="ghost" id="new-chat">New conversation</button>
+          <span class="error" id="ask-error" role="alert"></span>
+          <button type="submit" class="primary" id="ask-btn">Ask</button>
+        </div>
+      </form>
+    </section>
+  </div>
+
+  <script src="auth.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

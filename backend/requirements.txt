@@ -1,0 +1,4 @@
+# Packaged into the Lambda zip so the Bedrock APIs used here (reranking,
+# query decomposition, guardrails in RetrieveAndGenerate) are always available,
+# regardless of the boto3 version bundled in the Lambda runtime.
+boto3>=1.36.0
