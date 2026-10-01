@@ -1,536 +1,597 @@
-Enterprise RAG on Amazon Bedrock Knowledge Bases
+# Enterprise RAG on Amazon Bedrock Knowledge Bases
 
-An end-to-end company knowledge assistant built with Amazon Bedrock Knowledge Bases, OpenSearch Serverless, S3, Lambda, API Gateway, Cognito, CloudFront, DynamoDB, EventBridge, SQS, KMS and CloudWatch.
+A complete, deployable **company knowledge assistant**. Employees sign in, ask questions in plain language, and get answers drawn only from the company documents their team is allowed to read — with numbered citations that link to the source file.
 
-The application is designed around this flow:
+Everything is defined in Terraform and deploys from a single EC2 control machine.
 
-Employees / Browser
-        |
-        v
-CloudFront
-        |
-Private S3 frontend + OAC
-        |
-Cognito Hosted UI (OAuth code + PKCE)
-        |
-        v
-API Gateway HTTP API
-        |
-JWT Authorizer
-        |
-        v
-Lambda - RAG API -------------------- DynamoDB
-        |                               |
-        |                               +-- chat history / feedback
-        |
-        +--> Bedrock Knowledge Base
-                    |
-             OpenSearch Serverless
-                    |
-          vector retrieval / metadata filter
-                    |
-               Bedrock model
-                    |
-            answer + citations
+```
+                         Employees (browser)
+                                |
+                        CloudFront (+ optional WAF)
+                                |
+                 Static web app  (S3, private, OAC)
+                                |   sign in: Cognito Hosted UI (code + PKCE)
+                                v
+            API Gateway HTTP API  ── JWT authorizer (Cognito)
+                                |
+                        Lambda: RAG API ───────────── DynamoDB
+                  (ask / history / feedback / admin)   chat history,
+                                |                       session ownership
+                RetrieveAndGenerate + metadata filter
+                                |
+                   Bedrock Knowledge Base ── Guardrail
+                      /                \
+    OpenSearch Serverless            Foundation model
+     (vector index, faiss)           (Nova / Claude via
+              ^                       inference profile)
+              | parse, chunk, embed (Titan Text Embeddings V2)
+              |
+ S3 documents/ + .metadata.json ── EventBridge ── SQS ── Lambda: ingest
+                                  (object created/deleted)   StartIngestionJob
+```
 
-Document ingestion:
+---
 
-S3 documents/
-     |
-     v
-EventBridge
-     |
-     v
-SQS + DLQ
-     |
-     v
-Ingestion Lambda
-     |
-     v
-Bedrock StartIngestionJob
-     |
-     +--> parsing
-     +--> chunking
-     +--> Titan Text Embeddings V2
-     +--> OpenSearch Serverless vector index
+## What's Included
 
-Repository components
+| Area | What you get |
+| --- | --- |
+| **Retrieval** | Bedrock Knowledge Base, Titan Text Embeddings V2 (1,024 dims), OpenSearch Serverless vector index with faiss HNSW, fixed-size chunking (300 tokens, 20% overlap) |
+| **Generation** | `RetrieveAndGenerate` with a custom grounding prompt, citations, multi-turn sessions, optional reranking and query decomposition |
+| **Access control** | Cognito groups mapped to document metadata (`department`, `classification`); the filter is built only from the verified token |
+| **Safety** | Bedrock Guardrail (harmful content, prompt attacks, PII handling) |
+| **Ingestion** | Upload to S3 and the knowledge base syncs itself: EventBridge, batched through SQS, with retries and a dead-letter queue |
+| **API** | HTTP API with JWT authorizer, throttling, JSON access logs; routes for ask, history, feedback and admin sync |
+| **Web app** | Vanilla JS, no build step. Answers render with clickable citation markers and source cards with short-lived links |
+| **Security** | KMS customer-managed key (documents, chat table, logs), TLS-only bucket policy, least-privilege IAM, private S3 origins |
+| **Operations** | CloudWatch alarms (errors, 5xx, latency, ingestion DLQ) to SNS email, X-Ray tracing |
+| **Quality** | 32 unit tests, metadata validator, evaluation script that also checks for access-control leaks, GitHub Actions CI |
 
-backend/src/app/api_handler.py - API Lambda entry point
+---
 
-backend/src/app/ingest_handler.py - SQS-driven ingestion Lambda
+## Repository Layout
 
-backend/src/app/access.py - Cognito group to Bedrock metadata-filter logic
+```
+enterprise-bedrock-rag/
+├── Makefile                        make help lists every task
+├── backend/
+│   ├── src/app/
+│   │   ├── api_handler.py          API Lambda: routing, validation, error mapping
+│   │   ├── ingest_handler.py       Ingestion Lambda: SQS batch -> StartIngestionJob
+│   │   ├── access.py               Cognito groups -> Bedrock retrieval filter
+│   │   ├── rag.py                  RetrieveAndGenerate request + citation parsing
+│   │   ├── store.py                DynamoDB history, session ownership, feedback
+│   │   ├── config.py               Environment settings
+│   │   └── logutil.py              JSON logging
+│   ├── tests/                      pytest suites (no AWS needed)
+│   └── requirements*.txt
+├── infrastructure/terraform/
+│   ├── versions.tf                 providers (aws, opensearch, time, archive)
+│   ├── variables.tf, locals.tf, outputs.tf
+│   ├── storage.tf                  KMS key, documents bucket, DynamoDB table
+│   ├── opensearch.tf               collection, 3 policies, vector index
+│   ├── bedrock.tf                  KB service role, knowledge base, data source, guardrail
+│   ├── lambda.tf                   both functions, roles, log groups
+│   ├── ingestion.tf                EventBridge rule, SQS + DLQ, event source mapping
+│   ├── api.tf                      HTTP API, JWT authorizer, routes, stage
+│   ├── cognito.tf                  user pool, groups, hosted domain, app client
+│   ├── frontend.tf                 private bucket, CloudFront, config.js, optional WAF
+│   ├── monitoring.tf               SNS + alarms
+│   └── terraform.tfvars.example
+├── frontend/                       index.html, styles.css, auth.js, app.js
+├── sample-docs/documents/          9 sample documents across 5 departments + metadata
+├── eval/questions.jsonl            13 evaluation questions, including negative and access tests
+├── scripts/                        build, upload, sync, users, evaluation, local config
+└── docs/architecture.md            request flows and design decisions
+```
 
-backend/src/app/rag.py - retrieval/generation and citation parsing
+---
 
-backend/src/app/store.py - DynamoDB history/session/feedback
+## End-to-End Deployment Guide
 
-backend/src/app/config.py - runtime configuration
+> **This guide takes you from zero to a running RAG on AWS Bedrock.**
+> Estimated total time: **40–60 minutes** (most is waiting for AWS resources to provision).
 
-backend/src/app/logutil.py - structured logging
+### Prerequisites
 
-infrastructure/terraform/ - all AWS infrastructure
+| Requirement | Details |
+| --- | --- |
+| AWS account | With valid payment method and administrator access |
+| Region | `ap-south-1` (Mumbai) — Bedrock Knowledge Bases and Titan V2 must be available |
+| Bedrock model access | Amazon Titan Text Embeddings V2 + a generation model (Nova Pro recommended) |
 
-frontend/ - static browser application
+---
 
-sample-docs/documents/ - sample knowledge base content
+### Step 1 — Launch an EC2 Deployment Machine
 
-eval/ - evaluation questions
+Use an EC2 instance as your deployment control plane. This avoids Windows compatibility issues with bash scripts, `make`, and `zip`.
 
-scripts/ - deployment, upload, sync, user and evaluation helpers
+**Open AWS Console → EC2 → Launch instance** with these settings:
 
-docs/architecture.md - architecture/design details
+| Setting | Value |
+| --- | --- |
+| **Name** | `enterprise-rag-deployer` |
+| **Region** | `ap-south-1` (Mumbai) |
+| **AMI** | Ubuntu Server 24.04 LTS, 64-bit (x86) |
+| **Instance type** | `t3.small` |
+| **Key pair** | Create new → `enterprise-rag-key` (RSA, `.pem`) → save securely |
+| **Network** | Enable **Auto-assign public IP** |
+| **Security group** | Create new → allow only **SSH (TCP 22) from My IP** |
+| **Storage** | 20 GiB gp3 (encrypted) |
+| **IAM instance profile** | Attach a role with `AdministratorAccess` (for lab; restrict for production) |
 
-Architecture implemented by this repository
+> **⚠️ Security:** Never open SSH to `0.0.0.0/0`. Restrict to your IP only. For production, use Session Manager instead of SSH and a least-privilege IAM role.
 
-Query path
+Click **Launch instance** and wait for both status checks to pass.
 
-Browser
-  -> CloudFront
-  -> Cognito login
-  -> JWT
-  -> API Gateway HTTP API
-  -> JWT authorizer
-  -> Lambda RAG API
-  -> access.py builds a filter from verified Cognito groups
-  -> Bedrock Knowledge Base
-  -> OpenSearch Serverless
-  -> retrieval / optional reranking / query decomposition
-  -> foundation model or inference profile
-  -> citations
-  -> Lambda
-  -> API response
-  -> browser
+---
 
-Ingestion path
+### Step 2 — Connect to the EC2 Instance
 
-Document
-  -> S3 bucket under documents/
-  -> EventBridge Object Created/Deleted event
-  -> SQS
-  -> ingestion Lambda
-  -> Bedrock StartIngestionJob
-  -> Knowledge Base parsing
-  -> fixed-size chunking
-  -> Titan Text Embeddings V2
-  -> OpenSearch Serverless
+**From your local machine (PowerShell / Terminal):**
 
-The current Terraform configuration uses Titan Text Embeddings V2 at 1,024 dimensions, 300-token chunks and 20% overlap. Generation uses an ARN supplied by generation_model_arn; newer Bedrock models may require an inference-profile ARN.
+```bash
+# Replace with your .pem path and EC2 public IP
+ssh -i "enterprise-rag-key.pem" ubuntu@<EC2_PUBLIC_IP>
+```
 
-Prerequisites
+**Or use PuTTY on Windows:**
+1. Convert `.pem` to `.ppk` using PuTTYgen
+2. Connect with Host = EC2 public IP, User = `ubuntu`, Auth = `.ppk` file
 
-AWS account
+**After connecting, verify:**
 
-You need an AWS account with a valid payment method and sufficient service access. The deployment creates billable resources, especially OpenSearch Serverless and CloudFront.
+```bash
+whoami            # Expected: ubuntu
+uname -m          # Expected: x86_64
+cat /etc/os-release | head -3
+```
 
-Recommended deployment machine
+---
 
-Use an EC2 deployment/control machine rather than running the infrastructure directly from your laptop.
+### Step 3 — Install System Dependencies
 
-Recommended EC2 setup for this repo:
-
-Region:         ap-south-1 (Mumbai)
-AMI:            Ubuntu Server 24.04 LTS 64-bit x86
-Instance:       t3.small
-Root disk:      20 GiB gp3
-Public IPv4:    enabled for initial SSH
-Security:       SSH/22 from My IP only
-
-The repository README specifies Python 3.12, Terraform 1.6+, AWS CLI v2, make, zip and an AWS identity that can deploy the required resources.
-
-AWS authentication on EC2
-
-Prefer an EC2 IAM instance profile rather than long-lived access keys.
-
-For a temporary lab, the deployment instance can use a role with enough permissions to create the resources in this repository. A fast lab shortcut is temporary AdministratorAccess; remove it as soon as deployment/validation is finished. Production should use a dedicated least-privilege Terraform deployment role.
-
-Do not put AWS access keys in .env, the Git repository, shell scripts or Terraform variables.
-
-1. Create the EC2 deployment machine
-
-Open AWS Console -> EC2 -> Launch instance.
-
-Select ap-south-1.
-
-Select Ubuntu Server 24.04 LTS, 64-bit x86.
-
-Select t3.small.
-
-Create an RSA key pair such as enterprise-rag-key and save the .pem file securely.
-
-Enable a public IPv4 address.
-
-Create a security group allowing only:
-
-SSH TCP 22 -> My IP
-
-Do not open 0.0.0.0/0 on SSH.
-
-Attach an IAM instance profile to the EC2 instance. Include AmazonSSMManagedInstanceCore if you want Session Manager access.
-
-Use a 20 GiB gp3 encrypted root volume.
-
-Launch the instance.
-
-Verify the instance is Running and the status checks pass.
-
-2. Connect from PuTTY/SSH
-
-Use the EC2 public IPv4 address, user ubuntu, and the private key created during launch.
-
-After connecting:
-
-whoami
-hostname
-uname -m
-cat /etc/os-release
-
-Expected architecture is x86_64 and the OS should be Ubuntu.
-
-3. Prepare Ubuntu
-
-sudo apt update
-sudo apt upgrade -y
+```bash
+sudo apt update && sudo apt upgrade -y
 sudo apt install -y git curl unzip zip jq make python3 python3-pip python3-venv
+```
 
-Verify:
+**Verify:**
 
-git --version
-python3 --version
-pip3 --version
-make --version
-jq --version
+```bash
+git --version       # git version 2.x
+python3 --version   # Python 3.12+
+pip3 --version      # pip 24.x
+make --version      # GNU Make 4.x
+jq --version        # jq-1.7+
+```
 
-4. Install AWS CLI v2
+---
 
-Use the official AWS CLI v2 Linux installer. Example:
+### Step 4 — Install AWS CLI v2
 
+```bash
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
 unzip -q awscliv2.zip
 sudo ./aws/install
-aws --version
 rm -rf aws awscliv2.zip
+```
 
-Set the deployment region:
+**Set the deployment region:**
 
+```bash
 aws configure set region ap-south-1
-aws configure get region
+```
 
-Expected:
+**Verify your IAM role works (no access keys needed — the EC2 instance profile provides credentials):**
 
-ap-south-1
-
-Verify EC2 role authentication:
-
+```bash
 aws sts get-caller-identity
+```
 
-The ARN should represent your EC2-assumed role. Do not run aws configure with long-lived access keys.
+Expected output:
 
-5. Install Terraform
+```json
+{
+    "UserId": "AROAEXAMPLE:i-0abc123def456",
+    "Account": "111122223333",
+    "Arn": "arn:aws:sts::111122223333:assumed-role/YourEC2Role/i-0abc123def456"
+}
+```
 
-Use HashiCorp's official APT repository and install a Terraform version satisfying the repository requirement (>= 1.6.0).
+> **Note your 12-digit Account ID** — you'll need it in Step 8.
 
-Verify:
+> **⚠️ Important:** Do NOT run `aws configure` with long-lived access keys on EC2. The IAM instance profile is the secure way.
 
+---
+
+### Step 5 — Install Terraform
+
+```bash
+# Add HashiCorp GPG key and repository
+wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+sudo apt update && sudo apt install terraform -y
+```
+
+**Verify (must be ≥ 1.6.0):**
+
+```bash
 terraform version
+```
 
-6. Clone the exact repository
+---
 
+### Step 6 — Clone the Repository
+
+```bash
 cd ~
 git clone https://github.com/Mokshith-9391/enterprise-bedrock-rag.git
 cd ~/enterprise-bedrock-rag
+```
 
-git branch --show-current
-git status
+**Verify:**
 
-Expected branch:
+```bash
+git branch --show-current   # Expected: main
+ls -la                      # Should show Makefile, backend/, infrastructure/, etc.
+```
 
-main
+**Fix script permissions (Git on Windows can strip execute bits):**
 
-7. Fix Linux shell-script executable permissions
-
-Some Git environments can lose executable bits. Before running the Makefile:
-
+```bash
 chmod +x scripts/*.sh
+ls -l scripts/*.sh          # All should show -rwxr-xr-x
+```
 
-Check:
+---
 
-ls -l scripts/*.sh
+### Step 7 — Set Up Python and Run Tests
 
-Shell scripts such as build_lambda.sh, upload_docs.sh and sync_now.sh should have an x permission.
-
-If Git reports a mode change such as:
-
-mode change 100644 => 100755
-
-keep that change and commit it later so future Linux/CI environments do not reproduce the permission failure.
-
-8. Terraform formatting and Python tests
-
-Create a Python virtual environment:
-
+```bash
 cd ~/enterprise-bedrock-rag
+
+# Create a virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r backend/requirements-dev.txt
 
-Run tests:
+# Install dependencies
+pip install --upgrade pip
+pip install -r backend/requirements-dev.txt
 
+# Run the 32 unit tests
 make test
+```
 
-Format Terraform:
+Expected:
 
-terraform -chdir=infrastructure/terraform fmt -recursive
+```
+32 passed
+```
+
+**Validate Terraform formatting:**
+
+```bash
 terraform -chdir=infrastructure/terraform fmt -check -recursive
+```
 
-Validate Git changes:
+> **⚠️ Do NOT proceed if tests fail.** They validate critical RBAC security logic.
 
-git status --short
-git diff --check
-git diff -- infrastructure/terraform/ scripts/
+---
 
-9. Build the Lambda package
+### Step 8 — Enable Bedrock Model Access
 
-make build
+You need to explicitly enable model access in your AWS account before using any Bedrock models.
 
-The repository build script creates:
+**8a. Open the Bedrock Console:**
 
-build/lambda/
+1. Go to **AWS Console** → **Amazon Bedrock** → ensure region is **ap-south-1**
+2. Click **Model access** in the left sidebar
+3. Click **Modify model access**
 
-and installs Lambda dependencies for the target Python/ARM64 runtime.
+**8b. Enable these models:**
 
-Verify:
+| Model | Purpose | Approval time |
+| --- | --- | --- |
+| **Amazon Titan Text Embeddings V2** | Document embedding (vectors) | Instant |
+| **Amazon Nova Pro** | Answer generation | Instant |
+| (Optional) **Anthropic Claude** | Higher-quality generation | Minutes–hours |
 
-ls -lah build/lambda
-find build/lambda -maxdepth 2 -type f | head -30
+Click **Save changes** and wait for **Access granted** ✅.
 
-10. Check Amazon Bedrock model access
+**8c. Get your generation model's inference profile ARN:**
 
-Generation model
-
-List available inference profiles:
-
+```bash
 aws bedrock list-inference-profiles \
   --region ap-south-1 \
-  --query "inferenceProfileSummaries[?status=='ACTIVE'].{Name:inferenceProfileName,ARN:inferenceProfileArn,Type:type}" \
+  --query "inferenceProfileSummaries[?status=='ACTIVE'].{Name:inferenceProfileName,ARN:inferenceProfileArn}" \
   --output table
+```
 
-Choose an active profile supported in your account/region and put its ARN in generation_model_arn.
+**Copy the full ARN** for your chosen model, e.g.:
 
-For the lab run documented during this project, the selected generation profile was:
+```
+arn:aws:bedrock:ap-south-1:111122223333:inference-profile/apac.amazon.nova-pro-v1:0
+```
 
-APAC Amazon Nova Pro
+**8d. Verify embedding model availability:**
 
-with the account-specific inference-profile ARN returned by the command above.
-
-Embedding model
-
-The repository uses:
-
-amazon.titan-embed-text-v2:0
-
-Check availability:
-
+```bash
 aws bedrock get-foundation-model-availability \
   --region ap-south-1 \
   --model-id amazon.titan-embed-text-v2:0 \
   --output json
+```
 
-The important fields should report that authorization, entitlement and regional availability are available.
+**8e. Check embedding quotas (important — prevents ingestion failures):**
 
-Check the account's assigned quotas:
-
+```bash
 aws service-quotas list-service-quotas \
   --service-code bedrock \
   --region ap-south-1 \
-  --query "Quotas[?contains(QuotaName, 'Titan Text Embeddings V2')].[QuotaName,Value,Adjustable,QuotaCode]" \
+  --query "Quotas[?contains(QuotaName, 'Titan Text Embeddings V2')].[QuotaName,Value,Adjustable]" \
   --output table
+```
 
-Do this before starting ingestion. A model can show AUTHORIZED and still have an account-specific on-demand quota that is too low or zero, resulting in 429 ThrottlingException during direct InvokeModel calls or Knowledge Base ingestion.
+> **⚠️ A model can show AUTHORIZED but have a zero on-demand quota**, causing `429 ThrottlingException` during ingestion. If you see a zero or very low quota, request an increase via Service Quotas before proceeding.
 
-11. Create Terraform variables
+---
 
-From the repository root:
+### Step 9 — Configure Terraform Variables
+
+```bash
+cd ~/enterprise-bedrock-rag
 
 cp infrastructure/terraform/terraform.tfvars.example \
    infrastructure/terraform/terraform.tfvars
+
 nano infrastructure/terraform/terraform.tfvars
+```
 
-Minimum working example:
+**Set these values (replace the ARN with yours from Step 8c):**
 
+```hcl
 project_name = "enterprise-rag"
 environment  = "dev"
 region       = "ap-south-1"
 
-generation_model_arn = "<ACTIVE_INFERENCE_PROFILE_ARN>"
+# REQUIRED — paste your inference profile ARN from Step 8c
+generation_model_arn = "arn:aws:bedrock:ap-south-1:111122223333:inference-profile/apac.amazon.nova-pro-v1:0"
 
+# Leave empty — reranking isn't available in ap-south-1
 rerank_model_arn = ""
 
 departments = ["hr", "finance", "it", "projects", "training"]
 
-enable_guardrail          = true
+enable_guardrail           = true
 enable_query_decomposition = true
-enable_waf                  = false
-alarm_email                = ""
+enable_waf                 = false
 
-Do not commit a real terraform.tfvars containing environment/account-specific values.
+alarm_email = ""  # Optional: your-email@example.com for alarm notifications
+```
 
-12. Initialize and validate Terraform
+Save and exit (`Ctrl+O`, `Enter`, `Ctrl+X` in nano).
 
+> **⚠️ Never commit `terraform.tfvars`** — it's already in `.gitignore`.
+
+---
+
+### Step 10 — Initialize and Validate Terraform
+
+```bash
 terraform -chdir=infrastructure/terraform init
-terraform -chdir=infrastructure/terraform validate
+```
 
 Expected:
 
+```
+Terraform has been successfully initialized!
+```
+
+```bash
+terraform -chdir=infrastructure/terraform validate
+```
+
+Expected:
+
+```
 Success! The configuration is valid.
+```
 
-Optional provider inspection:
+---
 
-terraform -chdir=infrastructure/terraform providers
+### Step 11 — Build the Lambda Package
 
-13. Create the Terraform plan
+```bash
+make build
+```
 
+This packages your Python backend code for AWS Lambda (ARM64 architecture):
+
+```bash
+# Verify the package was created
+ls -lah build/lambda/
+find build/lambda -maxdepth 2 -type f | head -20
+```
+
+---
+
+### Step 12 — Review the Terraform Plan
+
+```bash
 terraform -chdir=infrastructure/terraform plan
+```
 
-Review the final summary.
+A clean first plan creates approximately **78 resources**:
 
-A clean first plan for this lab was:
-
+```
 Plan: 78 to add, 0 to change, 0 to destroy.
+```
 
-After the OpenSearch Serverless foundation was created separately, the normal plan became smaller. Your exact count depends on state and prior partial operations.
+Review the plan carefully — do not approve unexpected destroy or replace operations.
 
-Do not approve an unexpected destroy or replacement of the OpenSearch collection.
+---
 
-For a reproducible apply, save the plan:
+### Step 13 — Deploy Phase 1: OpenSearch Serverless Foundation
 
-terraform -chdir=infrastructure/terraform plan -out=tfplan
+The deployment requires **two phases** because the OpenSearch Terraform provider needs the collection endpoint to create the vector index, and that endpoint doesn't exist until the collection is created.
 
-14. Deploy in two phases
-
-This repository uses two deployment phases because the OpenSearch provider needs the collection endpoint before it can create the OpenSearch vector index.
-
-Phase 1 - OpenSearch Serverless foundation
-
+```bash
 terraform -chdir=infrastructure/terraform apply \
   -target=aws_opensearchserverless_collection.kb \
   -target=aws_opensearchserverless_access_policy.data \
   -target=time_sleep.aoss_policy_propagation
+```
 
-Review the targeted plan and type yes only when the plan is the expected OpenSearch/bootstrap operation.
+**Type `yes` when prompted.** This takes ~3–4 minutes.
 
-The first OpenSearch Serverless collection in an account may also cause AWS to create the service-linked role:
+**What Phase 1 creates:**
 
-AWSServiceRoleForAmazonOpenSearchServerless
+- KMS customer-managed encryption key
+- S3 document bucket (versioned, encrypted, TLS-only)
+- DynamoDB chat history table
+- OpenSearch Serverless encryption, network and data-access policies
+- OpenSearch Serverless VECTORSEARCH collection
+- 60-second wait for IAM policy propagation
 
-The first collection requires iam:CreateServiceLinkedRole.
+**Verify the collection is active:**
 
-Verify:
-
+```bash
 aws opensearchserverless batch-get-collection \
   --region ap-south-1 \
   --names enterprise-rag-dev-kb \
-  --output json
+  --output json | jq '.collectionDetails[0].status'
+```
 
-Expected status:
+Expected: `"ACTIVE"`
 
-ACTIVE
-
-Get the Terraform output:
-
+```bash
 terraform -chdir=infrastructure/terraform output vector_collection_endpoint
+```
 
-Phase 2 - full infrastructure
+---
 
-First run a normal plan:
+### Step 14 — Deploy Phase 2: Full Infrastructure
 
-terraform -chdir=infrastructure/terraform plan
+```bash
+terraform -chdir=infrastructure/terraform plan    # Review first
+terraform -chdir=infrastructure/terraform apply   # Type: yes
+```
 
-Make sure it shows no unwanted destroy/replacement.
+**This takes ~8–12 minutes.** Phase 2 creates everything else:
 
-Then:
+| Category | Resources created |
+| --- | --- |
+| **Vector index** | k-NN index in OpenSearch Serverless (faiss, HNSW, 1024 dims) |
+| **Bedrock** | Knowledge Base, S3 Data Source (300-token chunks, 20% overlap), Guardrail |
+| **Compute** | API Lambda (512 MB, arm64, 29s timeout), Ingest Lambda (256 MB, arm64, 30s) |
+| **API** | HTTP API Gateway, JWT authorizer, 6 routes, throttling (10 rps) |
+| **Auth** | Cognito User Pool, 7 groups, hosted domain, web client (PKCE) |
+| **Frontend** | S3 web bucket, CloudFront distribution, config.js, optional WAF |
+| **Ingestion** | EventBridge rule, SQS queue (batch 100, 60s window), DLQ |
+| **Monitoring** | SNS topic, 4 CloudWatch alarms (errors, 5xx, p90 latency, DLQ) |
 
-terraform -chdir=infrastructure/terraform apply
+**Troubleshooting common errors:**
 
-Alternatively, when you have created a saved plan and verified it:
+| Error | Cause | Fix |
+| --- | --- | --- |
+| `opensearch_index` 403 | Data access policy hasn't propagated | Re-run `terraform apply` |
+| "no such index" | Phase 1 didn't complete | Re-run from Step 13 |
+| `AccessDeniedException` on `InvokeModel` | Model access not enabled | Complete Step 8b in Bedrock Console |
+| `ValidationException` mentioning model | Used model ARN instead of inference profile | Fix `generation_model_arn` in `terraform.tfvars` |
 
-terraform -chdir=infrastructure/terraform apply tfplan
+---
 
-The full infrastructure creates the application resources defined in infrastructure/terraform/.
+### Step 15 — Verify Terraform Outputs
 
-15. Verify Terraform outputs
-
+```bash
 terraform -chdir=infrastructure/terraform output
+```
 
-Important outputs:
+**Important outputs:**
 
-web_url
-api_url
-docs_bucket
-knowledge_base_id
-data_source_id
-user_pool_id
-user_pool_client_id
-cognito_login_domain
-vector_collection_endpoint
-generation_model_arn
-guardrail_id
-region
+```
+web_url                   = "https://d1a2b3c4d5e6f7.cloudfront.net"
+api_url                   = "https://abc123.execute-api.ap-south-1.amazonaws.com"
+docs_bucket               = "enterprise-rag-dev-docs-111122223333"
+knowledge_base_id         = "ABCDEF1234"
+data_source_id            = "GHIJKL5678"
+user_pool_id              = "ap-south-1_AbCdEfGh"
+user_pool_client_id       = "1234567890abcdef"
+cognito_login_domain      = "https://enterprise-rag-dev-111122223333.auth.ap-south-1.amazoncognito.com"
+vector_collection_endpoint = "https://abcdef.ap-south-1.aoss.amazonaws.com"
+generation_model_arn      = "arn:aws:bedrock:ap-south-1:111122223333:inference-profile/..."
+guardrail_id              = "abc123def456"
+region                    = "ap-south-1"
+```
 
-Capture them for troubleshooting.
+Save these for troubleshooting.
 
-16. Verify the Knowledge Base
+---
 
+### Step 16 — Verify the Knowledge Base
+
+```bash
 KB_ID=$(terraform -chdir=infrastructure/terraform output -raw knowledge_base_id)
 DS_ID=$(terraform -chdir=infrastructure/terraform output -raw data_source_id)
 
+# Check Knowledge Base status
 aws bedrock-agent get-knowledge-base \
   --region ap-south-1 \
   --knowledge-base-id "$KB_ID" \
-  --output json
+  --query 'knowledgeBase.status' \
+  --output text
+```
 
-The Knowledge Base should reach:
+Expected: `ACTIVE`
 
-ACTIVE
-
-Check the data source:
-
+```bash
+# Check Data Source
 aws bedrock-agent get-data-source \
   --region ap-south-1 \
   --knowledge-base-id "$KB_ID" \
   --data-source-id "$DS_ID" \
-  --output json
+  --query 'dataSource.status' \
+  --output text
+```
 
-17. Upload documents
+Expected: `AVAILABLE`
 
-The repository's sample documents live under:
+---
 
-sample-docs/documents/
+### Step 17 — Upload Documents to the Knowledge Base
 
-Upload them with:
-
+```bash
 make upload
+```
 
-The script validates metadata and runs an S3 sync into:
+This runs `scripts/validate_metadata.py` to check all sidecar metadata, then syncs `sample-docs/documents/` into `s3://<docs-bucket>/documents/`.
 
-s3://<docs-bucket>/documents/
+**Verify the upload:**
 
-Verify:
-
+```bash
 DOCS_BUCKET=$(terraform -chdir=infrastructure/terraform output -raw docs_bucket)
-aws s3 ls "s3://$DOCS_BUCKET/documents/" --recursive
+aws s3 ls "s3://$DOCS_BUCKET/documents/" --recursive --human-readable
+```
 
-Each document can have a sidecar metadata file with the same base name plus .metadata.json.
+You should see 9 documents + 9 metadata files across 5 department folders:
 
-Example:
+```
+hr/leave-policy.md
+hr/leave-policy.md.metadata.json
+hr/work-from-home-policy.md
+finance/travel-policy.md
+finance/reimbursement-policy.md
+it/vpn-guide.md
+it/security-policy.md
+it/incident-response-runbook.md     ← confidential!
+projects/project-alpha-architecture.md
+training/aws-training-plan.md
+```
 
-documents/finance/travel-policy.md
-documents/finance/travel-policy.md.metadata.json
+Each document has a matching `.metadata.json` sidecar:
 
-Example metadata:
-
+```json
 {
   "metadataAttributes": {
     "department": "finance",
@@ -539,29 +600,27 @@ Example metadata:
     "year": 2026
   }
 }
+```
 
-department values should match your configured Cognito groups. classification is used for document access control.
+---
 
-18. Ingestion: automatic first, manual fallback
+### Step 18 — Wait for Document Ingestion
 
-S3 changes are designed to flow automatically:
+Uploading to S3 automatically triggers the ingestion pipeline:
 
-S3 -> EventBridge -> SQS -> ingestion Lambda -> StartIngestionJob
+```
+S3 upload → EventBridge (Object Created) → SQS (batched, 60s) → Ingest Lambda → StartIngestionJob
+```
 
-Check recent jobs first:
+**Monitor the ingestion job:**
 
+```bash
 make sync-status
+```
 
-Do not call make sync repeatedly if a sync is already in progress. Bedrock can return ConflictException when another operation is already using the Knowledge Base.
+Or use the raw AWS CLI:
 
-If no job is running and you need a manual sync:
-
-make sync
-
-The repository's manual sync script starts a job and waits for COMPLETE, FAILED or STOPPED.
-
-Direct AWS check:
-
+```bash
 aws bedrock-agent list-ingestion-jobs \
   --region ap-south-1 \
   --knowledge-base-id "$KB_ID" \
@@ -569,70 +628,32 @@ aws bedrock-agent list-ingestion-jobs \
   --sort-by attribute=STARTED_AT,order=DESCENDING \
   --max-results 5 \
   --output table
+```
 
-If needed, poll the latest job:
+**Wait until status is `COMPLETE`** (typically 1–3 minutes for 9 sample documents):
 
-JOB_ID=$(aws bedrock-agent list-ingestion-jobs \
-  --region ap-south-1 \
-  --knowledge-base-id "$KB_ID" \
-  --data-source-id "$DS_ID" \
-  --sort-by attribute=STARTED_AT,order=DESCENDING \
-  --max-results 1 \
-  --query 'ingestionJobSummaries[0].ingestionJobId' \
-  --output text)
+```
+┌──────┬─────────┬──────────┬────────┬────────┐
+│failed│ indexed │ scanned  │ status │  ...   │
+├──────┼─────────┼──────────┼────────┼────────┤
+│  0   │    9    │    9     │COMPLETE│  ...   │
+└──────┴─────────┴──────────┴────────┴────────┘
+```
 
-while true; do
-  STATUS=$(aws bedrock-agent get-ingestion-job \
-    --region ap-south-1 \
-    --knowledge-base-id "$KB_ID" \
-    --data-source-id "$DS_ID" \
-    --ingestion-job-id "$JOB_ID" \
-    --query 'ingestionJob.status' \
-    --output text)
+**If no job appears after 2 minutes**, trigger a manual sync:
 
-  echo "$(date '+%H:%M:%S') status=$STATUS"
+```bash
+make sync
+```
 
-  case "$STATUS" in
-    COMPLETE|FAILED|STOPPED) break ;;
-  esac
+> **⚠️ Do not run `make sync` repeatedly** if a sync is already `IN_PROGRESS`. Bedrock returns `ConflictException` when another job is running.
 
-  sleep 10
-done
+**If ingestion fails with `ThrottlingException` (429):**
 
-Final statistics:
+Test the embedding model directly:
 
-aws bedrock-agent get-ingestion-job \
-  --region ap-south-1 \
-  --knowledge-base-id "$KB_ID" \
-  --data-source-id "$DS_ID" \
-  --ingestion-job-id "$JOB_ID" \
-  --output json
-
-19. Important Bedrock throttling troubleshooting
-
-A particularly important account-level failure mode is:
-
-ValidationException / ThrottlingException
-Too many requests, please wait before trying again.
-
-If a direct test also returns 429, do not keep hammering the ingestion API.
-
-Check:
-
-aws bedrock get-foundation-model-availability \
-  --region ap-south-1 \
-  --model-id amazon.titan-embed-text-v2:0 \
-  --output json
-
-aws service-quotas list-service-quotas \
-  --service-code bedrock \
-  --region ap-south-1 \
-  --query "Quotas[?contains(QuotaName, 'Titan Text Embeddings V2')].[QuotaName,Value,Adjustable,QuotaCode]" \
-  --output table
-
-Then make a single small direct test:
-
-printf '%s' '{"inputText":"Enterprise RAG health check","dimensions":256,"normalize":true}' > /tmp/titan-test.json
+```bash
+printf '%s' '{"inputText":"health check","dimensions":256,"normalize":true}' > /tmp/titan-test.json
 
 aws bedrock-runtime invoke-model \
   --region ap-south-1 \
@@ -642,282 +663,372 @@ aws bedrock-runtime invoke-model \
   --body fileb:///tmp/titan-test.json \
   /tmp/titan-test.out
 
-If that direct invocation also gets 429, the application code is not the immediate cause. Check account quotas, billing/payment status and AWS Support before rebuilding the Knowledge Base.
+cat /tmp/titan-test.out | jq '.embedding | length'
+```
 
-Do not casually change the embedding model after the Knowledge Base exists. Changing embeddings generally means rebuilding the vector/Knowledge Base configuration rather than editing a single runtime variable.
+If this also returns 429, the issue is your account's on-demand quota — request an increase via Service Quotas (see Step 8e).
 
-20. Create demo users
+---
 
-The repository provides scripts/create_user.sh.
+### Step 19 — Create Demo Users
 
-Create users with your own strong passwords:
+```bash
+./scripts/create_user.sh admin@example.com   'Change-Me-Admin#2026' admin
+./scripts/create_user.sh hr.user@example.com 'Change-Me-Hr#2026'    hr
+./scripts/create_user.sh fin.user@example.com 'Change-Me-Fin#2026'  finance
+./scripts/create_user.sh it.user@example.com 'Change-Me-It#2026'    it
+./scripts/create_user.sh secops@example.com  'Change-Me-Sec#2026'   it confidential
+```
 
-./scripts/create_user.sh admin@example.com 'YOUR-STRONG-PASSWORD' admin
-./scripts/create_user.sh hr.user@example.com 'YOUR-STRONG-PASSWORD' hr
-./scripts/create_user.sh fin.user@example.com 'YOUR-STRONG-PASSWORD' finance
-./scripts/create_user.sh it.user@example.com 'YOUR-STRONG-PASSWORD' it
-./scripts/create_user.sh secops@example.com 'YOUR-STRONG-PASSWORD' it confidential
+> **⚠️ Replace passwords** with your own strong passwords (min 12 characters, upper + lower + number + symbol).
 
-Do not publish these passwords.
+**User access model:**
 
-The group-to-document model is:
+| User | Groups | Can read |
+| --- | --- | --- |
+| `admin@example.com` | `admin` | Everything; can trigger syncs |
+| `hr.user@example.com` | `hr` | HR documents (public + internal) |
+| `fin.user@example.com` | `finance` | Finance documents |
+| `it.user@example.com` | `it` | IT documents, **not** the confidential incident runbook |
+| `secops@example.com` | `it`, `confidential` | IT documents including the confidential runbook |
 
-admin                   -> full access
-hr                      -> HR public/internal
-finance                 -> Finance documents
-it                      -> IT public/internal
-it + confidential       -> IT confidential material
+The access filter is built from **verified Cognito group claims** — nothing in the request body can widen access.
 
-The access filter is built from verified Cognito group claims rather than trusting a group supplied in the request body.
+---
 
-21. Open the application
+### Step 20 — Open the Web Application
 
-Get the CloudFront URL:
-
+```bash
 terraform -chdir=infrastructure/terraform output -raw web_url
+```
 
-Open it in a browser.
+1. Copy the URL and open it in your browser
+2. Click **Sign in** — redirects to Cognito Hosted UI
+3. Enter a demo user's email and password
+4. After sign-in, you'll see the chat interface with your email and group badges
 
-The browser authenticates through Cognito, receives tokens, calls API Gateway, and the API invokes the RAG Lambda.
+**Try these demonstrations:**
 
-22. Local frontend testing
+| Test | Sign in as | Ask | Expected |
+| --- | --- | --- | --- |
+| Basic retrieval | `hr.user` | "How many days of annual leave do employees get?" | "24 days" with citation from leave-policy.md |
+| Access blocked | `it.user` | "Within how many hours must CERT-In be notified?" | "I couldn't find this in the documents you have access to." |
+| Access granted | `secops` | Same question as above | "6 hours" with citation from the confidential runbook |
+| Cross-document | `admin` | "Compare the work from home rules with the VPN requirements." | Cites both HR and IT documents |
+| Hallucination prevention | Any user | "What is our Mars office relocation policy?" | Refuses to answer |
 
-The repository also supports:
+---
 
-make web-local
+### Step 21 — Direct API/RAG Validation (Optional)
 
-This writes a local frontend/config.js using Terraform outputs and serves the frontend at:
+For low-level Bedrock validation without the browser:
 
-http://localhost:8080
-
-The repository already configures http://localhost:8080 as a CORS origin and Cognito callback URL.
-
-23. Direct API/RAG validation
-
-Use the deployed API or the browser first. For low-level Bedrock validation, retrieve-and-generate can query a Knowledge Base and generate a response using a foundation model or inference profile.
-
-Example variables:
-
+```bash
 KB_ID=$(terraform -chdir=infrastructure/terraform output -raw knowledge_base_id)
 GEN_MODEL=$(terraform -chdir=infrastructure/terraform output -raw generation_model_arn)
-
-Example direct request:
 
 aws bedrock-agent-runtime retrieve-and-generate \
   --region ap-south-1 \
   --input '{"text":"What is the employee leave policy?"}' \
-  --retrieve-and-generate-configuration "{\
-    \"type\":\"KNOWLEDGE_BASE\",\
-    \"knowledgeBaseConfiguration\":{\
-      \"knowledgeBaseId\":\"$KB_ID\",\
-      \"modelArn\":\"$GEN_MODEL\"\
-    }\
+  --retrieve-and-generate-configuration "{
+    \"type\":\"KNOWLEDGE_BASE\",
+    \"knowledgeBaseConfiguration\":{
+      \"knowledgeBaseId\":\"$KB_ID\",
+      \"modelArn\":\"$GEN_MODEL\"
+    }
   }" \
-  --output json
+  --output json | jq '.output.text'
+```
 
-The response should contain generated text and citation information when retrieval succeeds.
+The response should contain generated text with citation information.
 
-24. Evaluation
+---
 
-Run the cheap retrieval/access-control evaluation:
+### Step 22 — Run the Evaluation Suite
 
+```bash
+# Quick: retrieval hit@5 + access-control leak check (cheap, no generation)
 make evaluate
 
-Run answer generation checks as well:
-
+# Full: also generates answers and checks keywords/refusals
 make evaluate-full
+```
 
-The evaluation suite includes access-control cases and should report zero access-control leaks.
+Expected output:
 
-25. Monitoring
+```
+id                    hit@5   leaks  answer  top files
+leave-days            yes     0      -       leave-policy.md, ...
+runbook-blocked       -       0      -       (no results)
+runbook-allowed       yes     0      -       incident-response-runbook.md, ...
+not-in-docs           -       0      -       ...
 
-Terraform provisions CloudWatch/SNS monitoring for:
+Retrieval hit@5: 10/10 (100%)
+Access-control leaks: 0 (must be 0)
+```
 
-Lambda errors
+> **⚠️ "Access-control leaks: 0" is critical.** The script exits non-zero if any leak is detected — this can gate CI deployments.
 
-API Gateway 5xx
+---
 
-Lambda p90 latency
+### Step 23 — Local Frontend Testing (Optional)
 
-SQS ingestion DLQ messages
+From the EC2 instance:
 
-Useful commands:
+```bash
+make web-local
+```
 
-aws logs describe-log-groups --region ap-south-1 | grep enterprise-rag
-aws sns list-topics --region ap-south-1 | grep enterprise-rag
+This generates `frontend/config.js` from Terraform outputs and serves the UI at `http://localhost:8080`. The repository already configures `http://localhost:8080` as a CORS origin and Cognito callback URL.
 
-26. Security notes before production
+---
 
-This repository is a strong learning/demo architecture, but review these settings before treating it as production-ready:
+### Step 24 — Check Monitoring
 
-The current OpenSearch Serverless network policy allows public network access. Data access is still governed by IAM/data policies, but a production design should consider an AOSS VPC endpoint and private networking.
+```bash
+# List project log groups
+aws logs describe-log-groups --region ap-south-1 \
+  --query "logGroups[?contains(logGroupName, 'enterprise-rag')].logGroupName" \
+  --output table
 
-CloudFront is using the default certificate in the repository. Production should use an ACM certificate and a custom domain.
+# List alarms
+aws cloudwatch describe-alarms --region ap-south-1 \
+  --alarm-name-prefix enterprise-rag-dev \
+  --query "MetricAlarms[].{Name:AlarmName,State:StateValue}" \
+  --output table
+```
 
-The repository currently sets CloudFront's default certificate configuration directly rather than a custom domain certificate; review TLS settings before production.
+Terraform provisions these CloudWatch alarms:
 
-enable_waf defaults to false; enable and tune WAF for an internet-facing production application.
+| Alarm | Triggers when |
+| --- | --- |
+| `*-api-lambda-errors` | Any unhandled Lambda error in 5 minutes |
+| `*-api-5xx` | More than 5 API Gateway 5xx errors in 5 minutes |
+| `*-api-p90-latency` | p90 Lambda duration > 20 seconds for 3 consecutive periods |
+| `*-ingest-dlq` | Any message in the ingestion dead-letter queue |
 
-The repository has not provisioned CloudTrail in Terraform; add it if CloudTrail is a hard production requirement.
+---
 
-Replace temporary broad Terraform deployment permissions with a dedicated least-privilege deployment role.
+## Adding Your Own Documents
 
-Use separate AWS accounts/environments for production and development.
+### File Structure
 
-For highly sensitive material such as legal, board or M&A documents, prefer physically separate Knowledge Bases instead of relying only on metadata filtering.
+Place files under `documents/<department>/` with a sidecar `.metadata.json`:
 
-27. Clean shutdown / destroy procedure
+```
+documents/finance/travel-policy.pdf
+documents/finance/travel-policy.pdf.metadata.json
+```
 
-This is critical for a temporary lab because OpenSearch Serverless and other resources can continue generating charges.
+### Metadata Format
 
-First: stop ingestion and application activity
+```json
+{
+  "metadataAttributes": {
+    "department": "finance",
+    "document_type": "policy",
+    "classification": "internal",
+    "year": 2026
+  }
+}
+```
+
+**Rules:**
+
+- `department` must match a Cognito group (see `departments` in `terraform.tfvars`)
+- `classification` must be `public`, `internal`, or `confidential`
+  - Only `admin` and `confidential` groups see `confidential` documents
+- A document with no metadata is visible to admins only
+- Supported formats: PDF, Markdown, Text, HTML, Word (.doc/.docx), CSV, Excel (.xls/.xlsx)
+
+**Upload:**
+
+```bash
+./scripts/upload_docs.sh path/to/your/documents
+# Or: make upload  (uses sample-docs/documents/)
+```
+
+The sync starts automatically within ~60 seconds.
+
+---
+
+## How Access Control Works
+
+1. Cognito issues an ID token containing `cognito:groups`
+2. API Gateway's JWT authorizer verifies signature, issuer, audience and expiry
+3. `access.py` turns the verified groups into a Bedrock retrieval filter:
+
+   ```json
+   {"andAll": [
+     {"in": {"key": "department", "value": ["hr"]}},
+     {"in": {"key": "classification", "value": ["public", "internal"]}}
+   ]}
+   ```
+
+4. The vector search only considers chunks that match — documents outside the user's access never reach the model
+
+Nothing in the request body affects the filter. Sessions are also bound to their owner: a user can't continue someone else's conversation.
+
+For hard isolation of highly sensitive material (legal, board, M&A), use a separate knowledge base rather than metadata filtering.
+
+---
+
+## API Reference
+
+All routes except `/health` need `Authorization: Bearer <Cognito ID token>`.
+
+| Method & path | Body | Returns |
+| --- | --- | --- |
+| `GET /health` | — | `{"status": "ok"}` |
+| `POST /ask` | `{"question": "...", "session_id": "optional"}` | `answer` (with `[n]` markers), `sources[]`, `session_id`, `message_id`, `grounded`, `latency_ms` |
+| `GET /history` | — | Last 20 exchanges |
+| `POST /feedback` | `{"message_id": "...", "rating": "up" or "down", "comment": ""}` | `{"saved": true}` |
+| `POST /admin/sync` | `{}` | `202` with job ID, or `409` if already running |
+| `GET /admin/ingestion-jobs` | — | 10 most recent sync jobs with statistics |
+
+Errors return `{"error": "..."}` with 400, 403, 429, 502 or 500, plus a `request_id`.
+
+---
+
+## Configuration
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `generation_model_arn` | (required) | Inference profile or model ARN |
+| `region` | `ap-south-1` | Titan V2 and Knowledge Bases must be available |
+| `rerank_model_arn` | `""` | Empty disables reranking |
+| `chunk_max_tokens` / `chunk_overlap_percentage` | 300 / 20 | Affects newly ingested files |
+| `num_results` / `num_reranked` | 10 / 5 | Chunks retrieved / kept after reranking |
+| `enable_query_decomposition` | `true` | Better for "compare A and B" questions |
+| `enable_guardrail` | `true` | Content filters, prompt attacks, PII handling |
+| `enable_waf` | `false` | AWS WAF on CloudFront |
+| `force_destroy` | `true` | Lets `make destroy` delete non-empty buckets |
+
+---
+
+## Security Notes Before Production
+
+- Replace the **public OpenSearch network policy** with a VPC endpoint and run Lambda in private subnets
+- **Narrow `bedrock:InvokeModel`** from `foundation-model/*` to specific model IDs
+- Add a **custom domain** with ACM certificates for CloudFront and API Gateway
+- **Federate Cognito** with your corporate IdP (SAML/OIDC) and map IdP groups to Cognito groups
+- Enable **Bedrock model invocation logging** to S3 for audit
+- Set `enable_waf = true` and `force_destroy = false`
+- Store **Terraform state** in S3 with DynamoDB locking (see `versions.tf`)
+- Run `make evaluate-full` in **CI** after each document batch
+- Use separate AWS **accounts/environments** for production and development
+
+---
+
+## Cost
+
+| Service | Billing | Typical cost |
+| --- | --- | --- |
+| **OpenSearch Serverless** | Minimum OCU-hours even when idle | **~\$200–400/month** (dominant cost) |
+| Bedrock tokens | Pay per input/output token | Small at demo volumes |
+| Lambda, API Gateway, DynamoDB, S3, CloudFront | Pay per use | Negligible |
+| KMS | \$1/key/month + API calls | ~\$1/month |
+
+> **Run `make destroy` when you finish a session.** For a cheaper long-running environment, swap the vector store for Amazon S3 Vectors — only `opensearch.tf` and `storage_configuration` in `bedrock.tf` change.
+
+---
+
+## Clean Shutdown / Destroy Procedure
+
+> **⚠️ Critical for temporary labs.** OpenSearch Serverless continues generating charges when idle.
+
+### 1. Stop activity
 
 Don't start new sync jobs or tests while destroying.
 
-Second: destroy Terraform-managed resources
+### 2. Destroy Terraform resources
 
-From the repository root:
-
+```bash
 cd ~/enterprise-bedrock-rag
 source .venv/bin/activate
 make destroy
+```
 
-Review the destruction plan and confirm the intended project resources are being removed.
+Review the plan and type `yes`. The KMS key enters its 7-day deletion window.
 
-The repository has:
+### 3. Verify state is empty
 
-force_destroy = true
-
-for the lab buckets, so Terraform can delete non-empty S3 buckets. The KMS key is scheduled for deletion with a 7-day waiting period by the Terraform configuration.
-
-Third: verify Terraform state is empty
-
+```bash
 terraform -chdir=infrastructure/terraform state list
+# Should return nothing
+```
 
-It should return no managed resources after a successful destroy.
+### 4. Terminate the EC2 instance
 
-Fourth: terminate the EC2 deployment machine
-
-EC2 was your control plane and is not created by this Terraform project, so Terraform will not delete it.
-
-Terminate the instance from the EC2 console or:
-
+```bash
+# From your local machine (not from the EC2 itself):
 aws ec2 terminate-instances --instance-ids <EC2_INSTANCE_ID> --region ap-south-1
+```
 
-Also check for unattached EBS volumes. The root volume launched with the normal console setting is normally deleted on termination; preserved volumes continue to incur storage charges.
+Or terminate from the EC2 Console. The root volume is deleted on termination by default.
 
-Fifth: remove temporary IAM deployment permissions
+### 5. Remove temporary IAM permissions
 
-If you temporarily attached AdministratorAccess to the EC2 role, detach it.
+If you attached `AdministratorAccess` to the EC2 role, detach it now.
 
-If you created an inline deployment policy only for this lab (for example TerraformDeploymentBootstrap), remove that policy after the deployment machine is terminated, unless you intentionally want to reuse it.
+### 6. Verify no project resources remain
 
-Do not delete an IAM role that existed before this project unless you have confirmed it is used only by this project.
+```bash
+# Check for leftover resources
+aws s3api list-buckets --query "Buckets[?contains(Name, 'enterprise-rag-dev')].Name" --output table
+aws lambda list-functions --region ap-south-1 --query "Functions[?contains(FunctionName, 'enterprise-rag-dev')].FunctionName" --output table
+aws dynamodb list-tables --region ap-south-1 --query "TableNames[?contains(@, 'enterprise-rag-dev')]" --output table
+aws opensearchserverless list-collections --region ap-south-1 --output table
+```
 
-Sixth: check the OpenSearch Serverless service-linked role
+Also check the Console for: CloudFront, API Gateway, Cognito, KMS keys, CloudWatch log groups, SNS topics, SQS queues, EventBridge rules.
 
-OpenSearch Serverless can create:
+---
 
-AWSServiceRoleForAmazonOpenSearchServerless
+## Troubleshooting
 
-AWS requires all OpenSearch Serverless collections to be deleted before this service-linked role can be manually deleted. If this role is no longer used anywhere in the account, delete it after confirming there are no remaining AOSS collections.
+| Symptom | Likely cause and fix |
+| --- | --- |
+| Phase 2 fails creating `opensearch_index` with 403 | Data access policy hasn't propagated. Re-run `terraform apply`. |
+| Knowledge base creation fails: "no such index" | The index wasn't created. Re-run from Phase 1. |
+| `AccessDeniedException` on `InvokeModel` | Model access isn't enabled, or wrong ARN. Check Bedrock Console. |
+| `ValidationException` mentioning the model | Use an inference-profile ARN from `list-inference-profiles`. |
+| `ThrottlingException` / 429 on embedding | Account quota is zero or too low. Check Service Quotas. |
+| Sync completes but documents fail | Check `make sync-status` for `failed` count. Common: metadata >10 KB, unsupported format, scanned PDF with no text. |
+| Uploaded file isn't searchable | Wait ~1 minute for batched sync. Check ingestion job status. |
+| Every answer says "couldn't find this" | User's groups don't match document `department`, or documents lack metadata. |
+| Browser shows a CORS error | Only CloudFront URL and `local_dev_origin` are allowed. |
+| 503/504 on long questions | HTTP API 30s limit. Disable query decomposition or lower `num_results`. |
 
-Seventh: verify no project resources remain
+---
 
-Search by the project prefix:
+## Deployment Checklist
 
-aws s3api list-buckets \
-  --query "Buckets[?contains(Name, 'enterprise-rag-dev')].Name" \
-  --output table
-
-aws lambda list-functions \
-  --region ap-south-1 \
-  --query "Functions[?contains(FunctionName, 'enterprise-rag-dev')].FunctionName" \
-  --output table
-
-aws dynamodb list-tables \
-  --region ap-south-1 \
-  --query "TableNames[?contains(@, 'enterprise-rag-dev')]" \
-  --output table
-
-aws opensearchserverless list-collections \
-  --region ap-south-1 \
-  --output table
-
-Also check manually in the AWS Console for:
-
-CloudFront
-API Gateway
-Cognito
-KMS Customer managed keys
-CloudWatch log groups
-SNS topics
-SQS queues
-EventBridge rules
-IAM roles created specifically for enterprise-rag-dev
-
-Important billing expectation
-
-Destroying the stack prevents future resource runtime charges once resources are actually gone, but AWS can still bill usage that occurred before destruction. KMS customer-managed keys scheduled for deletion are not charged for key storage while pending deletion, and the key is permanently deleted after the waiting period. CloudFront distribution deletion can take time because the distribution must be disabled and propagated before it can be deleted.
-
-28. Final deployment checklist
-
-[ ] EC2 launched in ap-south-1
-[ ] SSH restricted to My IP
-[ ] EC2 IAM role attached
-[ ] AWS CLI works through IAM role
-[ ] Terraform installed
-[ ] Repository cloned
-[ ] scripts/*.sh executable
-[ ] make test passes
-[ ] make build succeeds
-[ ] Bedrock model access verified
-[ ] Bedrock quota verified
-[ ] terraform.tfvars configured
-[ ] terraform init succeeds
-[ ] terraform validate succeeds
-[ ] terraform plan reviewed
-[ ] AOSS Phase 1 succeeds
-[ ] AOSS collection ACTIVE
-[ ] Full Terraform deployment succeeds
-[ ] Knowledge Base ACTIVE
-[ ] Documents uploaded to S3
-[ ] Ingestion reaches COMPLETE
-[ ] Demo users created
-[ ] Cognito login works
-[ ] API Gateway JWT works
-[ ] RAG returns grounded answers + citations
-[ ] Access-control tests pass
-[ ] Monitoring checked
-[ ] AdministratorAccess removed
-[ ] Terraform destroy completed when finished
-[ ] EC2 terminated
-[ ] No leftover project resources
-
-AWS documentation references
-
-For current implementation details, check the AWS documentation for:
-
-EC2 launch and security groups
-
-Systems Manager Session Manager
-
-AWS CLI installation
-
-Terraform installation
-
-Amazon Bedrock Knowledge Bases supported models and Regions
-
-Bedrock StartIngestionJob, GetIngestionJob and RetrieveAndGenerate
-
-OpenSearch Serverless IAM permissions and service-linked roles
-
-CloudFront deletion
-
-EC2 termination and EBS delete-on-termination
-
-AWS KMS key deletion
-
-License
-
-Add your preferred license here.
+- [ ] EC2 launched in `ap-south-1`
+- [ ] SSH restricted to My IP
+- [ ] EC2 IAM role attached
+- [ ] AWS CLI works through IAM role (`aws sts get-caller-identity`)
+- [ ] Terraform ≥ 1.6.0 installed
+- [ ] Repository cloned
+- [ ] `scripts/*.sh` executable
+- [ ] `make test` passes (32 tests)
+- [ ] `make build` succeeds
+- [ ] Bedrock model access granted (Titan V2 + generation model)
+- [ ] Bedrock embedding quota verified
+- [ ] `terraform.tfvars` configured with inference profile ARN
+- [ ] `terraform init` succeeds
+- [ ] `terraform validate` succeeds
+- [ ] `terraform plan` reviewed
+- [ ] Phase 1 (AOSS) succeeds — collection `ACTIVE`
+- [ ] Phase 2 (full) succeeds
+- [ ] Knowledge Base is `ACTIVE`
+- [ ] Documents uploaded to S3
+- [ ] Ingestion reaches `COMPLETE`
+- [ ] Demo users created
+- [ ] Cognito login works in browser
+- [ ] RAG returns grounded answers with citations
+- [ ] Access-control tests pass (`make evaluate`)
+- [ ] Monitoring checked
+- [ ] **After done:** `make destroy` completed
+- [ ] **After done:** EC2 terminated
+- [ ] **After done:** No leftover project resources
